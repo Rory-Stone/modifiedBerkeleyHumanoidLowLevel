@@ -1,0 +1,54 @@
+import time
+from loop_rate_limiters import RateLimiter
+import berkeley_humanoid_lite_lowlevel.recoil as recoil
+
+# ===== user knobs =====
+TARGET_VEL = 0.50        # rad/s (+ CCW, - CW)
+TORQUE_LIMIT = 0.3       # N·m (raise if it stalls)
+CTRL_HZ = 200.0          # control update rate (Hz)
+# ======================
+
+args = recoil.util.get_args()
+bus = recoil.Bus(channel=args.channel, bitrate=1000000)
+device_id = args.id
+
+rate = RateLimiter(frequency=CTRL_HZ)
+
+# Optional: set velocity gains if your firmware exposes them; otherwise skip
+try:
+    bus.write_velocity_kp(device_id, 0.2)
+    # Some firmwares use KI for velocity loop instead of KD:
+    if hasattr(bus, "write_velocity_ki"):
+        bus.write_velocity_ki(device_id, 0.01)
+    elif hasattr(bus, "write_velocity_kd"):
+        bus.write_velocity_kd(device_id, 0.005)
+except AttributeError:
+    # If those functions don't exist in your build, it's fine—defaults will be used.
+    pass
+
+# Limit torque/current and switch to velocity mode
+bus.write_torque_limit(device_id, TORQUE_LIMIT)
+bus.set_mode(device_id, recoil.Mode.VELOCITY)
+bus.feed(device_id)
+
+try:
+    while True:
+        # In VELOCITY mode, the first PDO field is interpreted as target velocity (rad/s)
+        measured_position, measured_velocity = bus.write_read_pdo_2(
+            device_id, TARGET_VEL, 0.0
+        )
+
+        if measured_position is not None and measured_velocity is not None:
+            print(
+                f"cmd_vel {TARGET_VEL:+.3f} rad/s | "
+                f"pos {measured_position:+.3f} rad | "
+                f"vel {measured_velocity:+.3f} rad/s"
+            )
+
+        rate.sleep()
+
+except KeyboardInterrupt:
+    pass
+finally:
+    bus.set_mode(device_id, recoil.Mode.IDLE)
+    bus.stop()
