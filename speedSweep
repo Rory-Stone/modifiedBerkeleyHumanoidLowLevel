@@ -1,0 +1,77 @@
+# Copyright (c) 2025, The Berkeley Humanoid Lite Project Developers.
+
+import time
+import numpy as np
+
+from loop_rate_limiters import RateLimiter
+import berkeley_humanoid_lite_lowlevel.recoil as recoil
+
+
+# -------------------- Setup --------------------
+args = recoil.util.get_args()
+bus = recoil.Bus(channel=args.channel, bitrate=1000000)
+device_id = args.id
+
+# Keep the same knobs as the position example; these are written via the
+# fast frame for gains in the MCU (wrapper names preserved for compatibility).
+kp = 0.2
+kd = 0.005
+bus.write_position_kp(device_id, kp)
+bus.write_position_kd(device_id, kd)
+
+# Keep torque within a safe bound during the sweep
+bus.write_torque_limit(device_id, 0.2)
+
+# Switch to velocity (speed) control mode
+bus.set_mode(device_id, recoil.Mode.VELOCITY)
+bus.feed(device_id)
+
+# Command/heartbeat loop rate
+rate = RateLimiter(frequency=200.0)
+
+# Sweep settings
+v_min = -10.0
+v_max =  10.0
+v_step = 0.5
+dwell_s = 5.0
+
+speeds = np.arange(v_min, v_max + 1e-9, v_step)
+
+# Results will be (speed_rad_per_s, torque_Nm)
+samples = []
+
+print(f"Starting velocity sweep from {v_min} to {v_max} rad/s in {v_step} rad/s steps; dwell {dwell_s:.1f}s per step.\n")
+
+try:
+    for v_cmd in speeds:
+        t0 = time.time()
+
+        # Hold this velocity for 'dwell_s' seconds while feeding the controller
+        while (time.time() - t0) < dwell_s:
+            # In velocity mode, the second argument is the velocity target.
+            # The first argument (position target) is ignored by the MCU in this mode.
+            _pos_meas, _vel_meas = bus.write_read_pdo_2(device_id, 0.0, float(v_cmd))
+            bus.feed(device_id)
+            rate.sleep()
+
+        # After dwelling, query a torque-measuring fast frame.
+        # This frame returns (position_measured, torque_measured).
+        # Note: The write fields here are placeholders and ignored in velocity mode.
+        _pos_for_tau, tau_meas = bus.write_read_pdo_3(device_id, 0.0, 0.0)
+
+        samples.append((float(v_cmd), float(tau_meas)))
+        print(f"v = {v_cmd:+5.1f} rad/s  ->  tau = {tau_meas:+.4f} N·m")
+
+except KeyboardInterrupt:
+    print("\n[Interrupted] Printing collected data so far...\n")
+
+finally:
+    # Print final table
+    print("\n=== Velocity vs. Steady-State Torque ===")
+    print("speed_rad_per_s, torque_Nm")
+    for v, tau in samples:
+        print(f"{v:.3f}, {tau:.6f}")
+
+    # Return the ESC to idle
+    bus.set_mode(device_id, recoil.Mode.IDLE)
+    bus.stop()
