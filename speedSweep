@@ -59,8 +59,15 @@ try:
         # Note: The write fields here are placeholders and ignored in velocity mode.
         _pos_for_tau, tau_meas = bus.write_read_pdo_3(device_id, 0.0, 0.0)
 
-        samples.append((float(v_cmd), float(tau_meas)))
-        print(f"v = {v_cmd:+5.1f} rad/s  ->  tau = {tau_meas:+.4f} N·m")
+        # NEW (use the existing API in your repo)
+        tau_meas = bus.read_torque_measured(device_id)
+        if tau_meas is None:
+            print(f"v = {v_cmd:+5.1f} rad/s  ->  tau = NA")
+            samples.append((float(v_cmd), float('nan')))
+        else:
+            print(f"v = {v_cmd:+5.1f} rad/s  ->  tau = {tau_meas:+.4f} N·m")
+            samples.append((float(v_cmd), float(tau_meas)))
+
 
 except KeyboardInterrupt:
     print("\n[Interrupted] Printing collected data so far...\n")
