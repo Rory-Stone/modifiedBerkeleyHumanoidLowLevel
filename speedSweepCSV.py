@@ -70,6 +70,9 @@ def main():
     print(f"Writing CSV to {out_path}")
     print(f"Pre-ramp {PRERAMP_S}s: 0 -> {START_W} rad/s, then ramp {RAMP_TIME_S}s: {START_W} -> {END_W} rad/s")
 
+    # last torque value we successfully read (for continuous printing)
+    last_tau_for_print = None
+
     try:
         # --------- gentle pre-ramp: 0 -> START_W ---------
         if PRERAMP_S > 0:
@@ -79,13 +82,27 @@ def main():
                 t = time.time() - t0
                 frac = min(max(t / PRERAMP_S, 0.0), 1.0)
                 w_cmd = (1.0 - frac) * 0.0 + frac * START_W
+
                 pos_meas, vel_meas = bus.write_read_pdo_2(dev, 0.0, float(w_cmd))
                 bus.feed(dev)
+
+                # read + log torque on decimated ticks
                 if tick % TAU_DECIMATE == 0:
                     tau = sample_tau(bus, dev)
-                    if tau is not None and vel_meas is not None and math.isfinite(vel_meas):
+                    if tau is not None:
+                        last_tau_for_print = tau
+                    if (tau is not None) and (vel_meas is not None) and math.isfinite(vel_meas):
                         w.writerow([float(vel_meas), float(tau)])
-                if frac >= 1.0: break
+
+                # ---- NEW: continuous console print like MoveActuator (vel + torque) ----
+                if vel_meas is not None and math.isfinite(vel_meas):
+                    if last_tau_for_print is None or not math.isfinite(last_tau_for_print):
+                        print(f"Measured vel: {vel_meas:+.3f} rad/s\t torque: NA")
+                    else:
+                        print(f"Measured vel: {vel_meas:+.3f} rad/s\t torque: {last_tau_for_print:+.4f} N·m")
+
+                if frac >= 1.0:
+                    break
                 tick += 1
                 rate.sleep()
 
@@ -101,15 +118,26 @@ def main():
             pos_meas, vel_meas = bus.write_read_pdo_2(dev, 0.0, float(w_cmd))
             bus.feed(dev)
 
+            # read + log torque on decimated ticks
             if tick % TAU_DECIMATE == 0:
                 tau = sample_tau(bus, dev)
-                if tau is not None and vel_meas is not None and math.isfinite(vel_meas):
+                if tau is not None:
+                    last_tau_for_print = tau
+                if (tau is not None) and (vel_meas is not None) and math.isfinite(vel_meas):
                     w.writerow([float(vel_meas), float(tau)])
                     # flush occasionally so you don't lose data if interrupted
                     if (tick // TAU_DECIMATE) % 50 == 0:
                         f.flush()
 
-            if frac >= 1.0: break
+            # ---- NEW: continuous console print like MoveActuator (vel + torque) ----
+            if vel_meas is not None and math.isfinite(vel_meas):
+                if last_tau_for_print is None or not math.isfinite(last_tau_for_print):
+                    print(f"Measured vel: {vel_meas:+.3f} rad/s\t torque: NA")
+                else:
+                    print(f"Measured vel: {vel_meas:+.3f} rad/s\t torque: {last_tau_for_print:+.4f} N·m")
+
+            if frac >= 1.0:
+                break
             tick += 1
             rate.sleep()
 
