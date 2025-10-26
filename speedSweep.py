@@ -15,9 +15,9 @@ device_id = args.id
 # Keep the same knobs as the position example; these are written via the
 # fast frame for gains in the MCU (wrapper names preserved for compatibility).
 kp = 0.2
-kd = 0.005
-bus.write_position_kp(device_id, kp)
-bus.write_position_kd(device_id, kd)
+ki = 0.005
+bus.write_velocity_kp(device_id, kp)
+bus.write_velocity_ki(device_id, ki)
 
 # Keep torque within a safe bound during the sweep
 bus.write_torque_limit(device_id, 0.2)
@@ -27,7 +27,7 @@ bus.set_mode(device_id, recoil.Mode.VELOCITY)
 bus.feed(device_id)
 
 # Command/heartbeat loop rate
-rate = RateLimiter(frequency=200.0)
+rate = RateLimiter(frequency=50)
 
 # Sweep settings
 v_min = -10.0
@@ -57,8 +57,6 @@ try:
         # After dwelling, query a torque-measuring fast frame.
         # This frame returns (position_measured, torque_measured).
         # Note: The write fields here are placeholders and ignored in velocity mode.
-        _pos_for_tau, tau_meas = bus.write_read_pdo_3(device_id, 0.0, 0.0)
-
         # NEW (use the existing API in your repo)
         tau_meas = bus.read_torque_measured(device_id)
         if tau_meas is None:
