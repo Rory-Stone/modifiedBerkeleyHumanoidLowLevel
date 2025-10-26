@@ -8,7 +8,7 @@ import berkeley_humanoid_lite_lowlevel.recoil as recoil
 # ------------ user knobs ------------
 AMP_W = 10.0           # ramp between -AMP_W .. +AMP_W [rad/s]
 PERIOD_S = 8.0         # seconds for a full up+down ramp
-SAMPLE_HZ = 20.0       # loop rate (keep modest to avoid timeouts)
+SAMPLE_HZ = 200.0       # loop rate (keep modest to avoid timeouts)
 TAU_DECIMATE = 2       # read torque every N ticks (set to 1 for every tick)
 VEL_KP = 0.2
 VEL_KI = 0.005
