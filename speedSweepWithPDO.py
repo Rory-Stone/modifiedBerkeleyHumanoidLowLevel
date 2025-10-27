@@ -1,33 +1,41 @@
 # Copyright (c) 2025, The Berkeley Humanoid Lite Project Developers.
 
-import time, os, csv, struct, math
+import time, os, csv, math, struct
 from loop_rate_limiters import RateLimiter
 import berkeley_humanoid_lite_lowlevel.recoil as recoil
 
-# ------------------- user knobs -------------------
-TAU_MIN = -0.20            # sweep start torque [N·m]
-TAU_MAX = +0.20            # sweep end torque   [N·m]
-PRERAMP_S = 2.0            # seconds: 0  -> TAU_MIN (gentle)
-SWEEP_S   = 60.0           # seconds: TAU_MIN -> TAU_MAX (slow)
-LOOP_HZ   = 40.0           # one PDO-3 round-trip per tick
-VEL_LP_TC = 0.10           # velocity low-pass time constant [s]
-TORQUE_LIMIT_NM = 0.22     # safety limit (>= |TAU_MAX|, but still conservative)
-# --------------------------------------------------
+# ------------- user knobs -------------
+START_W = -10.0          # start speed [rad/s]
+END_W   = +10.0          # end speed   [rad/s]
+PRERAMP_S   = 3.0        # seconds: 0 -> START_W (gentle)
+RAMP_TIME_S = 120.0      # seconds: START_W -> END_W (slow sweep)
 
-def send_pdo3_and_get(bus, dev, pos_target: float, tau_target: float, timeout_s=0.008):
+LOOP_HZ = 40.0           # main loop rate
+CTRL_TICKS_PER_TORQUE = 1  # pattern: 1 control tick, then 1 torque tick (alternate)
+INTERFRAME_GAP_S = 0.0   # not needed for PDO-3; leave 0.0 (only for SDO fallback)
+
+VEL_KP = 0.2
+VEL_KI = 0.005
+TORQUE_LIMIT_NM = 0.20
+
+PRINT_DECIMATE = 1       # print every N ticks (1 = every tick)
+TIMEOUT_MS = 8           # CAN RX timeout if supported
+# --------------------------------------
+
+def read_torque_pdo3(bus, device_id, timeout_s=0.008):
     """
-    Fast frame:
-      TX: RECEIVE_PDO_3  [position_target, torque_target]
+    Fast torque read via PDO-3:
+      TX: RECEIVE_PDO_3  [position_target, torque_target] placeholders
       RX: TRANSMIT_PDO_3 [position_measured, torque_measured]
     """
     bus.transmit(recoil.CANFrame(
-        dev,
+        device_id,
         recoil.Function.RECEIVE_PDO_3,
         size=8,
-        data=struct.pack("<ff", float(pos_target), float(tau_target))
+        data=struct.pack("<ff", 0.0, 0.0)
     ))
     rx = bus.receive(
-        filter_device_id=dev,
+        filter_device_id=device_id,
         filter_function=recoil.Function.TRANSMIT_PDO_3,
         timeout=timeout_s
     )
@@ -41,108 +49,91 @@ def main():
     bus = recoil.Bus(channel=args.channel, bitrate=1000000)
     dev = args.id
 
-    # Slightly longer RX timeout helps on VMs
+    # Slightly longer timeout helps in VMs (if available)
     if hasattr(bus, "set_timeout_ms"):
-        try: bus.set_timeout_ms(10)
+        try: bus.set_timeout_ms(int(TIMEOUT_MS))
         except Exception: pass
 
-    # Choose a torque/current mode if available; fall back gracefully
-    target_mode = None
-    for name in ("TORQUE", "CURRENT", "IQ"):  # try common names
-        if hasattr(recoil.Mode, name):
-            target_mode = getattr(recoil.Mode, name)
-            break
-    if target_mode is None:
-        target_mode = recoil.Mode.VELOCITY  # fallback; MCU may ignore tau_target in this mode
+    # Controller setup + safety
+    if hasattr(bus, "write_velocity_kp"): bus.write_velocity_kp(dev, VEL_KP)
+    if hasattr(bus, "write_velocity_ki"): bus.write_velocity_ki(dev, VEL_KI)
+    if hasattr(bus, "write_torque_limit"): bus.write_torque_limit(dev, TORQUE_LIMIT_NM)
 
-    # Safety cap: make sure we can't exceed the requested sweep magnitude
-    if hasattr(bus, "write_torque_limit"):
-        bus.write_torque_limit(dev, float(TORQUE_LIMIT_NM))
-
-    bus.set_mode(dev, target_mode)
+    bus.set_mode(dev, recoil.Mode.VELOCITY)
     bus.feed(dev)
 
     rate = RateLimiter(frequency=LOOP_HZ)
 
-    # Buffer samples in memory; write CSV once at the end
-    rows = []  # (time_s, tau_cmd_Nm, tau_meas_Nm, vel_meas_rad_s, pos_meas_rad)
-
-    # State for velocity from position (finite difference + low-pass)
-    prev_t = None
-    prev_pos = None
-    vel_lp = 0.0
+    # Buffer samples; write CSV after the sweep (no disk I/O in loop)
+    rows = []  # (time_s, speed_cmd_rad_per_s, speed_meas_rad_per_s, torque_Nm)
 
     t_start = time.time()
+    last_vel = None
+    last_tau = None
 
-    def run_segment(duration_s: float, start_tau: float, end_tau: float):
-        nonlocal prev_t, prev_pos, vel_lp
+    pattern_len = CTRL_TICKS_PER_TORQUE + 1  # e.g., 1 control tick + 1 torque tick
+    tick = 0
+
+    def sweep(duration_s: float, start_w: float, end_w: float):
+        nonlocal tick, last_vel, last_tau
         t0 = time.time()
+        span = end_w - start_w
         while True:
             now = time.time()
             t = now - t0
-            if duration_s <= 0.0:
-                frac = 1.0
+            frac = 1.0 if duration_s <= 0 else max(0.0, min(1.0, t / duration_s))
+            w_cmd = start_w + span * frac
+
+            slot = tick % pattern_len
+            if slot < CTRL_TICKS_PER_TORQUE:
+                # CONTROL TICK: fast PDO-2 (command vel & read pos/vel)
+                _pos, vel = bus.write_read_pdo_2(dev, 0.0, float(w_cmd))
+                bus.feed(dev)
+                if vel is not None and math.isfinite(vel):
+                    last_vel = float(vel)
             else:
-                frac = max(0.0, min(1.0, t / duration_s))
+                # TORQUE TICK: fast PDO-3 (read torque only)
+                _p, tau = read_torque_pdo3(bus, dev, timeout_s=TIMEOUT_MS/1000.0)
+                bus.feed(dev)
+                if tau is not None and math.isfinite(tau):
+                    last_tau = float(tau)
+                    # Log only when we got a fresh torque AND we have a recent velocity
+                    if last_vel is not None and math.isfinite(last_vel):
+                        rows.append((now - t_start, float(w_cmd), last_vel, last_tau))
 
-            tau_cmd = start_tau + (end_tau - start_tau) * frac
-
-            # Single fast round-trip this tick
-            pos_meas, tau_meas = send_pdo3_and_get(bus, dev, 0.0, tau_cmd)
-            bus.feed(dev)
-
-            # Estimate velocity from position (no extra PDO needed)
-            vel_est = None
-            if (pos_meas is not None):
-                if prev_t is not None and prev_pos is not None:
-                    dt = now - prev_t
-                    if dt > 0:
-                        vel_inst = (pos_meas - prev_pos) / dt
-                        # 1st-order low-pass: alpha = dt/(TC+dt)
-                        alpha = dt / (VEL_LP_TC + dt)
-                        vel_lp = (1 - alpha) * vel_lp + alpha * vel_inst
-                        vel_est = vel_lp
-                prev_t = now
-                prev_pos = pos_meas
-
-            # Buffer only valid samples
-            if (tau_meas is not None) and (vel_est is not None):
-                rows.append((
-                    now - t_start,
-                    float(tau_cmd),
-                    float(tau_meas),
-                    float(vel_est),
-                    float(pos_meas)
-                ))
+            # Console print for monitoring (MoveActuator style)
+            if (PRINT_DECIMATE == 1) or (tick % PRINT_DECIMATE == 0):
+                if last_vel is not None and math.isfinite(last_vel):
+                    if last_tau is None or not math.isfinite(last_tau):
+                        print(f"Measured vel: {last_vel:+.3f} rad/s\t torque: NA")
+                    else:
+                        print(f"Measured vel: {last_vel:+.3f} rad/s\t torque: {last_tau:+.4f} N·m")
 
             if frac >= 1.0:
                 break
-
+            tick += 1
             rate.sleep()
 
     try:
-        print(f"Torque sweep: {TAU_MIN:+.3f} -> {TAU_MAX:+.3f} N·m at {LOOP_HZ:.0f} Hz (fast PDO-3). Ctrl+C to stop.")
-        # Gentle pre-ramp 0 -> TAU_MIN
-        if PRERAMP_S > 0.0 and TAU_MIN != 0.0:
-            run_segment(PRERAMP_S, 0.0, TAU_MIN)
-        # Main sweep TAU_MIN -> TAU_MAX
-        run_segment(SWEEP_S, TAU_MIN, TAU_MAX)
+        print(f"Sweep: {START_W:+.1f} → {END_W:+.1f} rad/s using fast PDO-2/3, loop {LOOP_HZ:.0f} Hz.")
+        # Gentle pre-ramp (0 -> START_W)
+        if PRERAMP_S > 0.0 and START_W != 0.0:
+            sweep(PRERAMP_S, 0.0, START_W)
+        # Main sweep (START_W -> END_W)
+        sweep(RAMP_TIME_S, START_W, END_W)
         print("Sweep complete.")
-
     except KeyboardInterrupt:
         print("\n[Interrupted]")
-
     finally:
-        # Write CSV once (no I/O inside loop)
+        # Write CSV once (no I/O during loop)
         os.makedirs("data", exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        path = f"data/torque_sweep_fastpdo_{stamp}.csv"
+        path = f"data/vel_torque_sweep_fastpdo_{stamp}.csv"
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["time_s","torque_cmd_Nm","torque_meas_Nm","speed_meas_rad_per_s","position_rad"])
-            for t_s, tau_cmd, tau_meas, w_meas, pos in rows:
-                w.writerow([f"{t_s:.3f}", f"{tau_cmd:.6f}", f"{tau_meas:.6f}", f"{w_meas:.6f}", f"{pos:.6f}"])
-
+            w.writerow(["time_s", "speed_cmd_rad_per_s", "speed_meas_rad_per_s", "torque_Nm"])
+            for t_s, w_cmd, w_meas, tau in rows:
+                w.writerow([f"{t_s:.3f}", f"{w_cmd:.6f}", f"{w_meas:.6f}", f"{tau:.6f}"])
         bus.set_mode(dev, recoil.Mode.IDLE)
         bus.stop()
         print(f"CSV saved: {path}")
